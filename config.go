@@ -26,6 +26,9 @@ type Config struct {
 	Port                          int      `json:",omitempty"`
 	PrivateKey                    []byte
 	KnownFingerprints             []KnownFingerprint
+	PreferAxolotl                 bool
+	AxolotlPrivateKey             []byte
+	KnownAxolotlKeys              []KnownAxolotlKey
 	RawLogFile                    string   `json:",omitempty"`
 	NotifyCommand                 []string `json:",omitempty"`
 	IdleSecondsBeforeNotification int      `json:",omitempty"`
@@ -46,6 +49,12 @@ type KnownFingerprint struct {
 	fingerprint    []byte `json:"-"`
 }
 
+type KnownAxolotlKey struct {
+	UserId         string
+	PublicKey      string
+	publicKey      []byte `json:"-"`
+}
+
 func ParseConfig(filename string) (c *Config, err error) {
 	contents, err := ioutil.ReadFile(filename)
 	if err != nil {
@@ -63,6 +72,15 @@ func ParseConfig(filename string) (c *Config, err error) {
 		c.KnownFingerprints[i].fingerprint, err = hex.DecodeString(known.FingerprintHex)
 		if err != nil {
 			err = errors.New("xmpp: failed to parse hex fingerprint for " + known.UserId + ": " + err.Error())
+			return
+		}
+	}
+
+	for i, known := range c.KnownAxolotlKeys {
+		c.KnownAxolotlKeys[i].publicKey, err = hex.DecodeString(known.PublicKey)
+		if err != nil {
+			err = errors.New("xmpp: failed to parse hex Axolotl public key for " +
+				             known.UserId + ": " + err.Error())
 			return
 		}
 	}
@@ -183,6 +201,17 @@ func enroll(config *Config, term *terminal.Terminal) bool {
 	config.OTRAutoAppendTag = true
 	config.OTRAutoStartSession = true
 	config.OTRAutoTearDown = false
+
+	term.SetPrompt("Prefer using Axolotl over OTR? This will allow you to send offline forward-secure encrypted messages to contacts who also have Axolotl. (Y/n): ")
+
+	
+	if useAxolotl, err := term.ReadLine(); err != nil || len(useAxolotl) == 0 || useAxolotl != "y" && useAxolotl != "Y" {
+		info(term, "Not using Axolotl...")
+		config.PreferAxolotl = false
+	} else {
+		info(term, "Okay. We'll prefer to use Axolotl, but fall back to using OTR when the contact we're speaking to doesn't have Axolotl support.")
+		config.PreferAxolotl = true
+	}
 
 	// List well known Tor hidden services.
 	knownTorDomain := map[string]string{

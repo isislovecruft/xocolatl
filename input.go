@@ -26,6 +26,10 @@ var uiCommands = []uiCommand{
 	{"help", helpCommand{}, "List known commands"},
 	{"nopaste", noPasteCommand{}, "Stop interpreting text verbatim"},
 	{"online", onlineCommand{}, "Set your status to Available / Online"},
+	{"axo-add", axolotlAddCommand{}, "Add a peer's Axolotl key which was received out-of-band"},
+	{"axo-info", axolotlInfoCommand{}, "Print Axolotl information, including which contacts support Axolotl"},
+	{"axo-query", axolotlQueryCommand{}, "Ask a contact if they support Axolotl"},
+	{"axo-start", axolotlStartCommand{}, "Initialise Axolotl with a contact"},
 	{"otr-auth", authCommand{}, "Authenticate a secure peer with a mutual, shared secret"},
 	{"otr-authoob", authOobCommand{}, "Authenticate a secure peer with out-of-band fingerprint verification"},
 	{"otr-authqa", authQACommand{}, "Authenticate a secure peer with a question and answer"},
@@ -98,6 +102,21 @@ type otrCommand struct {
 }
 
 type otrInfoCommand struct{}
+
+type axolotlAddCommand struct {
+	User      string    "uid"
+	PublicKey [32]byte
+}
+
+type axolotlInfoCommand struct {}
+
+type axolotlQueryCommand struct {
+	User string "uid"
+}
+
+type axolotlStartCommand struct {
+	User string "uid"
+}
 
 type versionCommand struct {
 	User string "uid"

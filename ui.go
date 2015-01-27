@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"flag"
@@ -21,7 +24,9 @@ import (
 	"syscall"
 	"time"
 
+	"code.google.com/p/go.crypto/curve25519"
 	"github.com/agl/xmpp"
+	"github.com/rakoo/goax"
 	"golang.org/x/crypto/otr"
 	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/html"
@@ -128,6 +133,15 @@ type Session struct {
 	knownStates map[string]string
 	privateKey  *otr.PrivateKey
 	config      *Config
+	// axolotlRatchets maps from a JID (*with* the resouce) to whether the
+	// contact has support for using Axolotl. If a contact has support for
+	// Axolotl, then we prefer that over OTR, as Axolotl allows for sending
+	// forward-secure, future-secure encrypted messages even while the contact
+	// is offline.
+	axolotlRatchets        map[string]*goax.Ratchet
+	// axolotlPrivateKey is a Curve25519 private key, i.e. a 32-byte array.
+	axolotlPrivateKey     [32]byte
+	axolotlPublicKey      [32]byte
 	// lastMessageFrom is the JID (without the resource) of the contact
 	// that we last received a message from.
 	lastMessageFrom string
@@ -162,6 +176,29 @@ type rosterEdit struct {
 	isComplete bool
 	// contents contains the edited roster, if isComplete is true.
 	contents []byte
+}
+
+func generateAxolotlKey() [32]byte {
+	privateKey := [32]byte{}
+	io.ReadFull(rand.Reader, privateKey[:])
+	return privateKey
+}
+
+func (s *Session) loadAxolotlKey() {
+	axoPrivKey := s.config.AxolotlPrivateKey
+	//info(s.term, fmt.Sprintf("Your Axolotl private key is %s",
+	//	base64.StdEncoding.EncodeToString(axoPrivKey)))
+
+	if len(axoPrivKey) == 0 {
+		info(s.term, "Generating new Curve25519 Axolotl private key...")
+		key := generateAxolotlKey()
+		s.axolotlPrivateKey = key
+		s.config.AxolotlPrivateKey = key[:]
+		s.config.Save()
+	}
+	curve25519.ScalarBaseMult(&s.axolotlPublicKey, &s.axolotlPrivateKey)
+	info(s.term, fmt.Sprintf("Your Axolotl public key is %s",
+		base64.StdEncoding.EncodeToString(s.axolotlPublicKey[:])))
 }
 
 func (s *Session) readMessages(stanzaChan chan<- xmpp.Stanza) {
@@ -369,6 +406,7 @@ func main() {
 		knownStates:       make(map[string]string),
 		privateKey:        new(otr.PrivateKey),
 		config:            config,
+	    axolotlRatchets:   make(map[string]*goax.Ratchet),
 		pendingRosterChan: make(chan *rosterEdit),
 		pendingSubscribes: make(map[string]string),
 		lastActionTime:    time.Now(),
@@ -397,7 +435,9 @@ func main() {
 	s.privateKey.Parse(config.PrivateKey)
 	s.timeouts = make(map[xmpp.Cookie]time.Time)
 
-	info(term, fmt.Sprintf("Your fingerprint is %x", s.privateKey.Fingerprint()))
+	info(term, fmt.Sprintf("Your OTR fingerprint is %x", s.privateKey.Fingerprint()))
+
+	s.loadAxolotlKey()
 
 	ticker := time.NewTicker(1 * time.Second)
 
@@ -620,6 +660,36 @@ MainLoop:
 				s.config.KnownFingerprints = append(s.config.KnownFingerprints, KnownFingerprint{fingerprint: fpr, UserId: cmd.User})
 				s.config.Save()
 				info(s.term, fmt.Sprintf("Saved manually verified fingerprint %s for %s", cmd.Fingerprint, cmd.User))
+			case axolotlInfoCommand:
+				info(term, fmt.Sprintf("Your Axolotl public key is %x", s.axolotlPublicKey))
+				if len(s.config.KnownAxolotlKeys) > 0 {
+					for peer, _ := range s.config.KnownAxolotlKeys {
+						info(term, fmt.Sprintf("%s supports Axolotl messaging", peer))
+						//printConversationInfo(&s, to, conversation)
+					}
+				}
+			case axolotlQueryCommand:
+				replyChan, cookie, err := s.conn.SendIQ(cmd.User, "get", AxolotlIQQuery{})
+				if err != nil {
+					alert(s.term, fmt.Sprintf("Error sending Axolotl query to %s: %s", cmd.User, err.Error()))
+					continue
+				}
+				s.timeouts[cookie] = time.Now().Add(3 * time.Second)
+
+				// XXX
+				// Make buffered channel for outgoing response data
+				//supportChan := make(chan bool, 1)
+				//go s.awaitAxolotlIQReply(replyChan, supportChan, cmd.User)
+				go s.awaitAxolotlIQReply(replyChan, cmd.User)
+
+				//if hasAxolotlSupport, open := <-supportChan; hasAxolotlSupport == true && !open {
+				//	ratchet := goax.New(rand.Reader, [32]byte(s.axolotlPrivateKey))
+				//	s.axolotlRatchets[cmd.User] = ratchet
+				//} else {
+				//	s.axolotlRatchets[cmd.User] = nil
+				//}
+			case axolotlStartCommand:
+				s.conn.Send(string(cmd.User), AxolotlQueryMessage)
 			case awayCommand:
 				s.conn.SignalPresence("away")
 			case chatCommand:
@@ -638,7 +708,12 @@ MainLoop:
 			}
 			switch stanza := rawStanza.Value.(type) {
 			case *xmpp.ClientMessage:
-				s.processClientMessage(stanza)
+				if s.config.PreferAxolotl == true {
+					ratchet := s.getAxolotlRatchet(stanza.From)
+					s.doAxolotlKEX(stanzaChan, stanza.From, ratchet)
+				} else {
+					s.processClientMessage(stanza)
+				}
 			case *xmpp.ClientPresence:
 				s.processPresence(stanza)
 			case *xmpp.ClientIQ:
@@ -669,8 +744,156 @@ MainLoop:
 			}
 		}
 	}
-
 	os.Stdout.Write([]byte("\n"))
+}
+
+// AxolotlQueryMessage can be sent to a peer to initiate an Axolotl ratchet
+var AxolotlQueryMessage = "?AXOLOTLv1?"
+
+var (
+	axolotlQueryMarker = []byte("?AXOLOTL")
+)
+
+func isAxolotlQuery(msg []byte) (greatestCommonVersion int) {
+	pos := bytes.Index(msg, axolotlQueryMarker)
+	if pos == -1 {
+		return 0
+	}
+	for i, c := range msg[pos+len(axolotlQueryMarker):] {
+		if i == 0 {
+			if c != 'v' {
+				return 0  // Invalid message
+			}
+			continue
+		}
+		if c == '?' || c == ' ' || c == '\t' {
+			return 0 // End of message
+		}
+		if c == '1' {
+			greatestCommonVersion = 2
+		}
+	}
+	return 0
+}
+
+// AxolotlQuery and AxolotlReply are Jabber IQ Stanzas used to inquire if a
+// peer supports using Axolotl for message encryption.
+type AxolotlIQQuery struct {
+	XMLName xml.Name `xml:"jabber:iq:axolotl query"`
+}
+
+type AxolotlIQReply struct {
+	XMLName xml.Name `xml:"jabber:iq:axolotl reply"`
+	Name    string   `xml:"name"`
+	Version string   `xml:"version"`
+}
+
+func (s *Session) getAxolotlRatchet(user string) *goax.Ratchet {
+	ratchet, ok := s.axolotlRatchets[user]
+	if !ok {
+		// We already tried to initialise an Axolotl KEX with this contact
+		// but they declined:
+		info(s.term, fmt.Sprintf("%s would prefer to use OTR.", user))
+		return nil
+	} else {
+		// The previous KEX was successful, so we'll use that:
+		info(s.term, fmt.Sprintf("Using previously completed Axolotl key exchange with %s!", user))
+	}
+	return ratchet
+}
+
+//func (s *Session) awaitAxolotlIQQueryReply(in <-chan xmpp.Stanza, out chan<-bool, user string) {
+func (s *Session) awaitAxolotlIQReply(in <-chan xmpp.Stanza, user string) {
+	info(s.term, fmt.Sprintf("Waiting to find out if %s has Axolotl support...", user))
+	//hasAxolotlSupport := false
+	logPrefix := fmt.Sprintf("Axolotl query to %s", user)
+
+	stanza, ok := <-in
+	if !ok {
+		warn(s.term, fmt.Sprintf("%s timed out.", logPrefix))
+		return
+	}
+	reply, ok := stanza.Value.(*AxolotlIQReply)
+	if !ok {
+		warn(s.term, fmt.Sprintf("%s resulted in a bad reply type: %s", logPrefix, reply.XMLName))
+		return
+	}
+	if reply.XMLName.Local == "error" {
+		warn(s.term, fmt.Sprintf("%s resulted in XMPP error: %s", logPrefix, reply))
+	}
+
+	var axolotlReply AxolotlIQReply
+	buf := bytes.NewBufferString(reply.Name + " " + reply.Version)
+	if err := xml.NewDecoder(buf).Decode(&axolotlReply); err != nil {
+		warn(s.term, fmt.Sprintf("Failed to parse Axolotl IQ reply from %s: %s", user, err.Error()))
+	} else if len(reply.Version) == 0 {
+		info(s.term, fmt.Sprintf("%s doesn't support Axolotl.", user))
+	} else {
+		info(s.term, fmt.Sprintf("Hooray! %s supports Axolotl: %s", user, axolotlReply))
+		ratchet := goax.New(rand.Reader, [32]byte(s.axolotlPrivateKey))
+		s.axolotlRatchets[user] = ratchet
+	}
+	//out <-hasAxolotlSupport
+	//close(out)
+}
+
+func (s *Session) awaitAxolotlKEXReply(in <-chan xmpp.Stanza, out chan<-goax.KeyExchange, user string) {
+	logPrefix := fmt.Sprintf("remote Axolotl key exchange message")
+
+	stanza, ok := <-in
+	if !ok {
+		alert(s.term, fmt.Sprintf("Error while processing %s stanza: %s", logPrefix, stanza))
+		return
+	}
+	reply, ok := stanza.Value.(*xmpp.ClientMessage)
+	if !ok {
+		warn(s.term, fmt.Sprintf("Error while parsing %s: %s", logPrefix, reply))
+		return
+	}
+	if reply.Type == "error" {
+		warn(s.term, fmt.Sprintf("%s resulted in XMPP error: %s", logPrefix, reply.Body))
+	}
+
+	var remoteKEX goax.KeyExchange
+	json.Unmarshal([]byte(reply.Body), &remoteKEX)
+	info(s.term, fmt.Sprintf("Remote KEX is %s", remoteKEX))
+	// causing races
+	//out <-remoteKEX
+	//close(out)
+}
+
+func (s *Session) doAxolotlKEX(ch <-chan xmpp.Stanza, user string, ratchet *goax.Ratchet) {
+    logPrefix := fmt.Sprintf("Axolotl key exchange with %s", user)
+
+	info(s.term, fmt.Sprintf("Attempting %s...", logPrefix))
+	kex, err := ratchet.GetKeyExchangeMaterial()
+	if err != nil {
+		alert(s.term, fmt.Sprintf("During Axolotl key exchange with %s: %s", user, err.Error()))
+		return
+	}
+	info(s.term, fmt.Sprintf("DEBUG: Axolotol KEX Public Identity: %s", kex.IdentityPublic))
+	info(s.term, fmt.Sprintf("DEBUG: Axolotol KEX DH0: %s", kex.Dh))
+	info(s.term, fmt.Sprintf("DEBUG: Axolotol KEX DH1: %s", kex.Dh1))
+
+	marshalled, err := json.Marshal(kex)
+	if err != nil {
+		alert(s.term, fmt.Sprintf("Error while JSON marshalling KEX data: %s", err.Error()))
+	}
+
+	info(s.term, fmt.Sprintf("Sending Axolotl key exchange material to %s...", user))
+	s.conn.Send(user, string(marshalled))
+	info(s.term, fmt.Sprintf("Waiting for %s to complete the key exchange...", user))
+
+	exchangeChan := make(chan goax.KeyExchange, 1)
+	go s.awaitAxolotlKEXReply(ch, exchangeChan, user)
+	if remoteKEX, open := <-exchangeChan; !open {
+		err = ratchet.CompleteKeyExchange(remoteKEX)
+		if err != nil {
+			alert(s.term, fmt.Sprintf("Error while completing Axolotl key exchange: %s", err.Error()))
+		} else {
+			info(s.term, fmt.Sprintf("Axolotl key exchange with %s completed!", user))
+		}
+	}
 }
 
 func (s *Session) processIQ(stanza *xmpp.ClientIQ) interface{} {
@@ -685,6 +908,14 @@ func (s *Session) processIQ(stanza *xmpp.ClientIQ) interface{} {
 		return nil
 	}
 	switch startElem.Name.Space + " " + startElem.Name.Local {
+	case "jabber:iq:axolotl query":
+		info(s.term, "Responding to Axolotl IQ...") // XXX
+		if s.config.PreferAxolotl {
+			return AxolotlIQReply{
+				Name:    "xocolatl",
+				Version: "0.0.1",
+			}
+		}
 	case "http://jabber.org/protocol/disco#info query":
 		return xmpp.DiscoveryReply{
 			Identities: []xmpp.DiscoveryIdentity{
@@ -772,6 +1003,10 @@ func (s *Session) processClientMessage(stanza *xmpp.ClientMessage) {
 		conversation = new(otr.Conversation)
 		conversation.PrivateKey = s.privateKey
 		s.conversations[from] = conversation
+	}
+
+	if axolotlVersion := isAxolotlQuery([]byte(stanza.Body)); axolotlVersion >= 1 {
+		alert(s.term, fmt.Sprintf("Initiating Axolotl ratchet with %s", from))
 	}
 
 	out, encrypted, change, toSend, err := conversation.Receive([]byte(stanza.Body))
